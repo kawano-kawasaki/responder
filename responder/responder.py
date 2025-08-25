@@ -44,10 +44,13 @@ class LidarFiveFrameSaver(Node):
         self.sequence_id = 0
         self.voxel_size = 0.05
 
-        # 保存用キューとワーカースレッド
+        # 保存用キューとワーカースレッド（複数スレッドで I/O 並列化）
         self.save_queue = queue.Queue()
-        self.worker_thread = threading.Thread(target=self._save_worker, daemon=True)
-        self.worker_thread.start()
+        self.worker_threads = []
+        for _ in range(3):  # 3スレッドに増やす
+            t = threading.Thread(target=self._save_worker, daemon=True)
+            t.start()
+            self.worker_threads.append(t)
 
         # タイマー：0.2秒ごとにキューにジョブ追加
         self.create_timer(0.2, self.timer_callback)
@@ -68,14 +71,15 @@ class LidarFiveFrameSaver(Node):
     def _save_worker(self):
         while True:
             frames, timestamps = self.save_queue.get()
-            self.get_logger().info(f"Saving seq {self.sequence_id} started")  # 開始ログ
+            with threading.Lock():  # sequence_id 更新をスレッド安全に
+                sequence_id = self.sequence_id
+                self.sequence_id += 1
+            # self.get_logger().info(f"Saving seq {sequence_id} started")  # 開始ログ
             combined_points = np.vstack(frames)
             filtered = self.filter_frames(combined_points)
             timestamp = timestamps[0]  # 最も古いフレームのタイムスタンプ
-            sequence_id = self.sequence_id
-            self.sequence_id += 1
             self.save_all_files(filtered, timestamp, sequence_id)
-            self.get_logger().info(f"Saving seq {sequence_id} finished")  # 終了ログ
+            # self.get_logger().info(f"Saving seq {sequence_id} finished")  # 終了ログ
 
     def save_all_files(self, points, timestamp, sequence_id):
         self.save_bin(points, sequence_id)
@@ -88,18 +92,14 @@ class LidarFiveFrameSaver(Node):
         return np.array(pts, dtype=np.float32)
 
     def filter_frames(self, combined_pts: np.ndarray) -> np.ndarray:
-        # 体素インデックスを計算
+        # さらに高速化：NumPy ベクトル演算、unique 集約
         voxel_indices = np.floor(combined_pts[:, :3] / self.voxel_size).astype(np.int32)
-
-        # ユニークなキーを取得
         keys, inverse = np.unique(voxel_indices, axis=0, return_inverse=True)
 
         # 各ボクセルごとに平均を取る
         sums = np.zeros((keys.shape[0], 4), dtype=np.float64)
-        counts = np.bincount(inverse)
-
         np.add.at(sums, inverse, combined_pts)
-
+        counts = np.bincount(inverse)
         means = sums / counts[:, None]
 
         return means.astype(np.float32)
